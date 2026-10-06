@@ -33,6 +33,58 @@ const EXPAND_PINPOINTS_JS = `(() => {
   return { headers, bodies: bodies.length, steps: steps.length, details: details.length };
 })()`;
 
+// Powertrain pages embed shared ("SPA") pinpoint tests as collapsed
+// <span class="spappt" data-spapptfile="2021_GASOLINE_HD"> headers whose body
+// PTS loads on click: a POST to the same Proc endpoint with
+// searchNumber "<spapptfile>_spappt" and procUid = this page's docID.
+// Fetch each one and insert it after its header so it prints with the page.
+async function inlineSharedPinpointTests(
+  pageHTML: string,
+  docID: string,
+  fetchPageParams: FetchManualPageParams
+): Promise<{ html: string; found: number; inlined: number }> {
+  const files = Array.from(
+    new Set(
+      Array.from(
+        pageHTML.matchAll(/class="spappt"[^>]*data-spapptfile="([^"]+)"/g)
+      ).map((m) => m[1])
+    )
+  );
+  let html = pageHTML;
+  let inlined = 0;
+  for (const file of files) {
+    try {
+      const body = await fetchManualPage({
+        ...fetchPageParams,
+        searchNumber: `${file}_spappt`,
+        procUid: docID,
+        diagTool: "FDRS",
+        category: "32",
+      });
+      if (typeof body !== "string" || body.trim().length === 0) {
+        console.warn(`-> WARNING: empty SPA pinpoint test ${file} (docID ${docID})`);
+        continue;
+      }
+      // insert right after the header span that carries this file name
+      const marker = new RegExp(
+        `(<span[^>]*data-spapptfile="${file}"[^>]*>)`
+      );
+      const at = html.search(marker);
+      if (at < 0) continue;
+      const close = html.indexOf("<br", at);
+      const insertAt = close > at ? close : at;
+      html =
+        html.slice(0, insertAt) +
+        `<div class="spappt-inlined" data-spapptfile="${file}">${body}</div>` +
+        html.slice(insertAt);
+      inlined++;
+    } catch (e) {
+      console.warn(`-> WARNING: could not fetch SPA pinpoint test ${file} (docID ${docID}): ${e}`);
+    }
+  }
+  return { html, found: files.length, inlined };
+}
+
 export default async function saveEntireManual(
   path: string,
   toc: any,
@@ -105,10 +157,22 @@ export default async function saveEntireManual(
       }
 
       try {
-        const pageHTML = await fetchManualPage({
+        let pageHTML = await fetchManualPage({
           ...fetchPageParams,
           searchNumber: docID,
         });
+
+        if (options.expandPinpoints && pageHTML.includes('class="spappt"')) {
+          const spa = await inlineSharedPinpointTests(
+            pageHTML,
+            docID,
+            fetchPageParams
+          );
+          pageHTML = spa.html;
+          console.log(
+            `-> Shared (SPA) pinpoint tests: ${spa.inlined} of ${spa.found} inlined`
+          );
+        }
 
         if (options.saveHTML) {
           const htmlPath = resolve(join(path, `/${filename}.html`));
