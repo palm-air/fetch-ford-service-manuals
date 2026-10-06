@@ -1,4 +1,5 @@
 import { mkdir, writeFile } from "fs/promises";
+import { existsSync } from "fs";
 import { join, resolve } from "path";
 import fetchManualPage, { FetchManualPageParams } from "./fetchManualPage";
 import client from "../client";
@@ -6,7 +7,31 @@ import { Page } from "playwright";
 import { CLIArgs } from "../processCLIArgs";
 import saveStream, { sanitizeName } from "../utils";
 
-export type SaveOptions = Pick<CLIArgs, "saveHTML" | "ignoreSaveErrors">;
+export type SaveOptions = Pick<
+  CLIArgs,
+  "saveHTML" | "ignoreSaveErrors" | "expandPinpoints" | "onlyPath" | "skipExisting"
+>;
+
+// Pinpoint tests ship inside the page HTML but collapsed: each test body is a
+// <div id="PPTx" style="display:none">, its steps are hidden
+// <tr data-content-type="step"> rows, and "click for details" text sits in a
+// hidden <span> after its link. Un-hide them all so they print. No clicking, so
+// the page can't navigate away. Selectors credit: upstream PR #43 (octoben).
+const EXPAND_PINPOINTS_JS = `(() => {
+  const show = (el, v) => { el.style.display = v; };
+  const headers = document.querySelectorAll(".isipppt").length;
+  const bodies = document.querySelectorAll('div[id^="PPT"]');
+  bodies.forEach((e) => show(e, "block"));
+  const steps = document.querySelectorAll('tr[data-content-type="step"]');
+  steps.forEach((e) => show(e, ""));
+  const details = document.querySelectorAll('a[data-pptlinktype="clickfordetails"]');
+  details.forEach((a) => {
+    show(a, "none");
+    const next = a.nextElementSibling;
+    if (next && next.tagName === "SPAN") show(next, "inline");
+  });
+  return { headers, bodies: bodies.length, steps: steps.length, details: details.length };
+})()`;
 
 export default async function saveEntireManual(
   path: string,
@@ -21,6 +46,12 @@ export default async function saveEntireManual(
     const [name, docID] = exploded[i];
 
     if (typeof docID === "string" && docID.length > 0) {
+      if (
+        options.onlyPath &&
+        !join(path, sanitizeName(name)).includes(options.onlyPath)
+      ) {
+        continue;
+      }
       // download and save document
       if (docID.startsWith("http") && docID.includes(".pdf")) {
         console.log(`Downloading manual PDF ${name} ${docID}`);
@@ -64,6 +95,15 @@ export default async function saveEntireManual(
         console.log(`-> Truncating filename, learn more in the README`);
       }
 
+      const pdfPath = join(path, `/${filename}.pdf`);
+      if (options.skipExisting && existsSync(pdfPath)) {
+        console.log(`-> Skipping, PDF already exists: ${pdfPath}`);
+        continue;
+      }
+      if (options.onlyPath) {
+        await mkdir(path, { recursive: true });
+      }
+
       try {
         const pageHTML = await fetchManualPage({
           ...fetchPageParams,
@@ -81,8 +121,27 @@ export default async function saveEntireManual(
         await browserPage.evaluate(
           'document.querySelectorAll("body > div > table > tbody > tr > td:nth-child(2)").forEach(e => e.remove())'
         );
+        if (options.expandPinpoints) {
+          const found = (await browserPage.evaluate(EXPAND_PINPOINTS_JS)) as {
+            headers: number;
+            bodies: number;
+            steps: number;
+            details: number;
+          };
+          if (found.headers > 0 || found.bodies > 0) {
+            console.log(
+              `-> Expanded pinpoint tests: ${found.headers} headers, ${found.bodies} bodies, ${found.steps} steps, ${found.details} details`
+            );
+          }
+          if (found.headers > found.bodies) {
+            console.warn(
+              `-> WARNING: ${found.headers} pinpoint headers but only ${found.bodies} bodies in ${name} (docID ${docID}); page layout may differ. Re-run with --saveHTML to inspect.`
+            );
+          }
+        }
+
         await browserPage.pdf({
-          path: join(path, `/${filename}.pdf`),
+          path: pdfPath,
         });
       } catch (e) {
         if (options.ignoreSaveErrors) {
@@ -102,7 +161,8 @@ export default async function saveEntireManual(
       const newPath = join(path, sanitizeName(name));
 
       try {
-        await mkdir(newPath, { recursive: true });
+        // with --onlyPath, folders are created only when a document is saved
+        if (!options.onlyPath) await mkdir(newPath, { recursive: true });
       } catch (e) {
         if ((e as any).code === "EEXIST") {
           console.log(
